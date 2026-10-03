@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional
 
 from learning.database import PredictionDB
 
@@ -17,8 +17,12 @@ class MonitorStatus:
     recent_brier: Optional[float] = None
     total_logged: int = 0
 
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
-def check_health(db: PredictionDB, min_n: int = 20, min_acc: float = 0.48) -> MonitorStatus:
+
+def check_health(db: PredictionDB, min_n: int = 20, min_acc: float = 0.48) -> Dict[str, Any]:
+    """Return a plain dict so /api/state can JSON-serialize without 500s."""
     st = MonitorStatus()
     stats = db.stats()
     st.total_logged = stats["total"]
@@ -39,4 +43,4 @@ def check_health(db: PredictionDB, min_n: int = 20, min_acc: float = 0.48) -> Mo
     if stats["total"] == 0:
         st.flags.append("no predictions logged yet")
 
-    return st
+    return st.to_dict()

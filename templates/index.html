@@ -44,7 +44,22 @@
     async function refresh() {
       try {
         const r = await fetch('/api/state');
-        const s = await r.json();
+        const text = await r.text();
+        let s;
+        try {
+          s = JSON.parse(text);
+        } catch (parseErr) {
+          document.getElementById('signal').textContent =
+            'API error: HTTP ' + r.status + ' (non-JSON response)';
+          document.getElementById('health').textContent = text.slice(0, 400);
+          return;
+        }
+        if (!r.ok) {
+          document.getElementById('signal').textContent =
+            'API error: HTTP ' + r.status + (s.error ? ' — ' + s.error : '');
+          document.getElementById('health').textContent = JSON.stringify(s, null, 2);
+          return;
+        }
         const p = s.prediction || {};
         const el = document.getElementById('signal');
         el.textContent = p.signal || (p.direction ? p.direction : 'Waiting for data…');
@@ -57,9 +72,10 @@
           ['Regime', p.regime || '—'],
           ['Agreement', p.agreement != null ? (p.agreement*100).toFixed(0) + '%' : '—'],
         ].map(([l,v]) => `<div class="stat"><div class="lbl">${l}</div><div class="val">${v}</div></div>`).join('');
+        const errStr = Array.isArray(s.error) ? s.error.join('; ') : (s.error || '');
         document.getElementById('meta').textContent =
           `cycle ${s.cycle || 0} · data age ${(p.data_age_sec||0).toFixed(1)}s · ${s.last_update || ''}` +
-          (s.error ? ' · ' + s.error : '');
+          (errStr ? ' · ' + errStr : '');
         document.getElementById('keys').innerHTML = (p.key_signals || []).map(x => `<li>${x}</li>`).join('');
         document.getElementById('risks').textContent = (p.risk_factors || []).slice(0,4).join(' · ');
         document.getElementById('health').textContent = JSON.stringify({health: s.health, db: s.db_stats, backtest: s.backtest}, null, 2);

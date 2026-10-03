@@ -84,14 +84,14 @@ def cycle_once(predictor: Predictor, db: PredictionDB, log_every: bool = True) -
                 confidence=pred.confidence,
                 price=pred.price,
                 regime=pred.regime,
-                models=pred.model_scores,
-                notes=pred.critique_notes,
+                models=pred.model_scores if hasattr(pred, "model_scores") else pred.model_detail,
+                notes=pred.critique_notes if hasattr(pred, "critique_notes") else pred.critique_summary,
             )
             STATE["_last_log_ts"] = time.time()
 
     resolve_pending(db, predictor)
     STATE["db_stats"] = db.stats()
-    STATE["health"] = check_health(db)
+    STATE["health"] = check_health(db)  # now always a plain dict
     STATE["cycle"] = STATE.get("cycle", 0) + 1
     return pred
 
