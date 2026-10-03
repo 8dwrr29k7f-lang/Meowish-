@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>XVANTAGE BTC 15m</title>
+  <style>
+    :root { --bg:#0b1220; --card:#121a2b; --text:#e8eefc; --muted:#8b9bb8; --up:#3dd68c; --down:#f07178; --line:#1e2a44; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--text); }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 8px; }
+    .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+    .signal { font-size: 1.4rem; font-weight: 700; letter-spacing: 0.02em; }
+    .up { color: var(--up); }
+    .down { color: var(--down); }
+    .neutral { color: var(--muted); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(140px,1fr)); gap: 12px; margin-top: 12px; }
+    .stat { background: #0d1526; border-radius: 8px; padding: 12px; }
+    .stat .lbl { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; }
+    .stat .val { font-size: 1.1rem; margin-top: 4px; }
+    ul { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 0.9rem; }
+    .err { color: var(--down); font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>XVANTAGE · BTC 15m Predictor</h1>
+    <div class="sub">Research / education only · not financial advice · live public market data</div>
+    <div class="card">
+      <div id="signal" class="signal neutral">Loading…</div>
+      <div class="grid" id="stats"></div>
+      <div id="meta" class="sub" style="margin-top:12px"></div>
+      <ul id="keys"></ul>
+      <div id="risks" class="err"></div>
+    </div>
+    <div class="card">
+      <div class="lbl" style="color:var(--muted);font-size:0.75rem;text-transform:uppercase">Health / DB</div>
+      <pre id="health" style="white-space:pre-wrap;color:var(--muted);font-size:0.85rem"></pre>
+    </div>
+  </div>
+  <script>
+    async function refresh() {
+      try {
+        const r = await fetch('/api/state');
+        const s = await r.json();
+        const p = s.prediction || {};
+        const el = document.getElementById('signal');
+        el.textContent = p.signal || (p.direction ? p.direction : 'Waiting for data…');
+        el.className = 'signal ' + ((p.direction || 'neutral').toLowerCase());
+        document.getElementById('stats').innerHTML = [
+          ['P(UP)', ((p.p_up || 0)*100).toFixed(1) + '%'],
+          ['P(DOWN)', ((p.p_down || 0)*100).toFixed(1) + '%'],
+          ['Confidence', ((p.confidence || 0)*100).toFixed(0) + '% ' + (p.confidence_label || '')],
+          ['Price', p.price ? p.price.toFixed(2) : '—'],
+          ['Regime', p.regime || '—'],
+          ['Agreement', p.agreement != null ? (p.agreement*100).toFixed(0) + '%' : '—'],
+        ].map(([l,v]) => `<div class="stat"><div class="lbl">${l}</div><div class="val">${v}</div></div>`).join('');
+        document.getElementById('meta').textContent =
+          `cycle ${s.cycle || 0} · data age ${(p.data_age_sec||0).toFixed(1)}s · ${s.last_update || ''}` +
+          (s.error ? ' · ' + s.error : '');
+        document.getElementById('keys').innerHTML = (p.key_signals || []).map(x => `<li>${x}</li>`).join('');
+        document.getElementById('risks').textContent = (p.risk_factors || []).slice(0,4).join(' · ');
+        document.getElementById('health').textContent = JSON.stringify({health: s.health, db: s.db_stats, backtest: s.backtest}, null, 2);
+      } catch (e) {
+        document.getElementById('signal').textContent = 'API error: ' + e;
+      }
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
