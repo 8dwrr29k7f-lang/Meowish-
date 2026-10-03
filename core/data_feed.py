@@ -1,6 +1,6 @@
 """
 Multi-source live market data for BTC 15m prediction.
-Binance klines / depth / trades + Coinbase cross-check.
+Coinbase primary (works from Railway US) + Kraken + optional Binance.
 """
 
 from __future__ import annotations
@@ -12,8 +12,10 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-BINANCE = "https://api.binance.com"
 COINBASE = "https://api.exchange.coinbase.com"
+KRAKEN = "https://api.kraken.com"
+BINANCE = "https://api.binance.com"  # often 451 from US cloud regions
+BINANCE_US = "https://api.binance.us"
 
 
 @dataclass
@@ -43,14 +45,14 @@ class MarketSnapshot:
 
     def is_usable(self) -> bool:
         return self.price > 0 and self.price_age < 30 and not (
-            len(self.errors) > 3 and self.price_age > 15
+            len(self.errors) > 5 and self.price_age > 15
         )
 
 
 class DataFeed:
     def __init__(self, symbol: str = "BTCUSDT"):
         self.symbol = symbol
-        self._client = httpx.Client(timeout=8.0)
+        self._client = httpx.Client(timeout=10.0, follow_redirects=True)
         self.last_snapshot: Optional[MarketSnapshot] = None
         self._cache: Dict[str, Any] = {}
         self._cache_ts: Dict[str, float] = {}
@@ -69,9 +71,88 @@ class DataFeed:
                 return self._cache[key]
             raise
 
-    def _binance_klines(self, interval: str, limit: int = 100) -> List[Candle]:
+    # ---- Coinbase (primary — works from US cloud) ----
+
+    def _coinbase_ticker(self) -> dict:
+        r = self._client.get(f"{COINBASE}/products/BTC-USD/ticker")
+        r.raise_for_status()
+        return r.json()
+
+    def _coinbase_book(self) -> dict:
         r = self._client.get(
-            f"{BINANCE}/api/v3/klines",
+            f"{COINBASE}/products/BTC-USD/book", params={"level": 2}
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def _coinbase_candles(self, granularity: int, limit: int = 100) -> List[Candle]:
+        """granularity in seconds: 60, 300, 900, 3600, ..."""
+        r = self._client.get(
+            f"{COINBASE}/products/BTC-USD/candles",
+            params={"granularity": granularity},
+        )
+        r.raise_for_status()
+        rows = r.json()
+        # Coinbase returns [time, low, high, open, close, volume] newest first
+        rows = sorted(rows, key=lambda x: x[0])[-limit:]
+        out = []
+        for row in rows:
+            out.append(
+                Candle(
+                    open_time=float(row[0]),
+                    open=float(row[3]),
+                    high=float(row[2]),
+                    low=float(row[1]),
+                    close=float(row[4]),
+                    volume=float(row[5]),
+                )
+            )
+        return out
+
+    # ---- Kraken ----
+
+    def _kraken_ticker(self) -> dict:
+        r = self._client.get(
+            f"{KRAKEN}/0/public/Ticker", params={"pair": "XBTUSD"}
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data["result"].get("XXBTZUSD") or data["result"].get("XBTUSD") or {}
+
+    def _kraken_ohlc(self, interval: int, limit: int = 60) -> List[Candle]:
+        """interval in minutes: 1, 5, 15, 60, ..."""
+        r = self._client.get(
+            f"{KRAKEN}/0/public/OHLC",
+            params={"pair": "XBTUSD", "interval": interval},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        result = data["result"]
+        key = next(k for k in result if k != "last")
+        rows = result[key][-limit:]
+        out = []
+        for row in rows:
+            out.append(
+                Candle(
+                    open_time=float(row[0]),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[6]),
+                )
+            )
+        return out
+
+    # ---- Binance (optional; often 451 from US) ----
+
+    def _binance_klines(self, base: str, interval: str, limit: int = 100) -> List[Candle]:
+        r = self._client.get(
+            f"{base}/api/v3/klines",
             params={"symbol": self.symbol, "interval": interval, "limit": limit},
         )
         r.raise_for_status()
@@ -89,108 +170,140 @@ class DataFeed:
             )
         return out
 
-    def _binance_ticker(self) -> dict:
+    def _binance_ticker(self, base: str) -> dict:
         r = self._client.get(
-            f"{BINANCE}/api/v3/ticker/bookTicker",
+            f"{base}/api/v3/ticker/bookTicker",
             params={"symbol": self.symbol},
         )
         r.raise_for_status()
         return r.json()
 
-    def _binance_depth(self) -> dict:
-        r = self._client.get(
-            f"{BINANCE}/api/v3/depth",
-            params={"symbol": self.symbol, "limit": 20},
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def _binance_trades(self) -> list:
-        r = self._client.get(
-            f"{BINANCE}/api/v3/trades",
-            params={"symbol": self.symbol, "limit": 50},
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def _coinbase_price(self) -> Optional[float]:
-        try:
-            r = self._client.get(f"{COINBASE}/products/BTC-USD/ticker")
-            r.raise_for_status()
-            return float(r.json().get("price") or 0)
-        except Exception:
-            return None
-
     def snapshot(self) -> MarketSnapshot:
         snap = MarketSnapshot()
-        errors = []
+        errors: List[str] = []
 
         def task(name, fn):
             try:
                 return name, fn(), None
             except Exception as e:
-                return name, None, str(e)
+                return name, None, str(e)[:180]
 
         jobs = [
-            ("ticker", lambda: self._cached("ticker", 1.5, self._binance_ticker)),
-            ("depth", lambda: self._cached("depth", 2.0, self._binance_depth)),
-            ("trades", lambda: self._cached("trades", 2.0, self._binance_trades)),
-            ("k1m", lambda: self._cached("k1m", 5.0, lambda: self._binance_klines("1m", 120))),
-            ("k5m", lambda: self._cached("k5m", 15.0, lambda: self._binance_klines("5m", 60))),
-            ("k15m", lambda: self._cached("k15m", 30.0, lambda: self._binance_klines("15m", 60))),
-            ("k30m", lambda: self._cached("k30m", 60.0, lambda: self._binance_klines("30m", 40))),
-            ("k1h", lambda: self._cached("k1h", 120.0, lambda: self._binance_klines("1h", 40))),
-            ("cb", lambda: self._cached("cb", 5.0, self._coinbase_price)),
+            ("cb_ticker", lambda: self._cached("cb_ticker", 1.5, self._coinbase_ticker)),
+            ("cb_book", lambda: self._cached("cb_book", 2.5, self._coinbase_book)),
+            ("cb_1m", lambda: self._cached("cb_1m", 8.0, lambda: self._coinbase_candles(60, 120))),
+            ("cb_5m", lambda: self._cached("cb_5m", 20.0, lambda: self._coinbase_candles(300, 60))),
+            ("cb_15m", lambda: self._cached("cb_15m", 40.0, lambda: self._coinbase_candles(900, 60))),
+            ("cb_1h", lambda: self._cached("cb_1h", 120.0, lambda: self._coinbase_candles(3600, 40))),
+            ("kr_ticker", lambda: self._cached("kr_ticker", 2.0, self._kraken_ticker)),
+            ("kr_1m", lambda: self._cached("kr_1m", 15.0, lambda: self._kraken_ohlc(1, 60))),
+            ("kr_15m", lambda: self._cached("kr_15m", 45.0, lambda: self._kraken_ohlc(15, 40))),
+            # Binance as soft fallback (may 451)
+            ("bn_ticker", lambda: self._cached("bn_ticker", 5.0, lambda: self._binance_ticker(BINANCE))),
         ]
 
-        results = {}
-        with ThreadPoolExecutor(max_workers=6) as ex:
+        results: Dict[str, Any] = {}
+        with ThreadPoolExecutor(max_workers=8) as ex:
             futs = [ex.submit(task, n, fn) for n, fn in jobs]
             for fut in as_completed(futs):
                 name, val, err = fut.result()
                 if err:
-                    errors.append(f"{name}: {err}")
+                    # Downgrade Binance geo-blocks to quiet notes
+                    if "451" in err or "binance" in name:
+                        errors.append(f"{name}: geo-blocked/unavailable")
+                    else:
+                        errors.append(f"{name}: {err}")
                 else:
                     results[name] = val
 
-        ticker = results.get("ticker") or {}
-        if ticker:
-            snap.bid = float(ticker.get("bidPrice") or 0)
-            snap.ask = float(ticker.get("askPrice") or 0)
-            if snap.bid and snap.ask:
+        # ---- Price + book from Coinbase ----
+        cb = results.get("cb_ticker") or {}
+        if cb:
+            try:
+                snap.price = float(cb.get("price") or 0)
+                snap.bid = float(cb.get("bid") or 0)
+                snap.ask = float(cb.get("ask") or 0)
+                if snap.price > 0:
+                    snap.price_ts = time.time()
+                    snap.price_age = 0.0
+            except (TypeError, ValueError):
+                pass
+
+        book = results.get("cb_book") or {}
+        if book:
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+            bid_vol = sum(float(b[1]) for b in bids[:10]) if bids else 0.0
+            ask_vol = sum(float(a[1]) for a in asks[:10]) if asks else 0.0
+            total = bid_vol + ask_vol
+            snap.imbalance = (bid_vol - ask_vol) / total if total > 0 else 0.0
+            snap.book_stale = False
+            if snap.price <= 0 and bids and asks:
+                snap.bid = float(bids[0][0])
+                snap.ask = float(asks[0][0])
                 snap.price = (snap.bid + snap.ask) / 2
                 snap.price_ts = time.time()
                 snap.price_age = 0.0
 
-        depth = results.get("depth") or {}
-        if depth:
-            bids = depth.get("bids") or []
-            asks = depth.get("asks") or []
-            bid_vol = sum(float(b[1]) for b in bids[:10]) if bids else 0
-            ask_vol = sum(float(a[1]) for a in asks[:10]) if asks else 0
-            total = bid_vol + ask_vol
-            snap.imbalance = (bid_vol - ask_vol) / total if total > 0 else 0.0
-            snap.book_stale = False
+        # Kraken cross-check / fallback price
+        kr = results.get("kr_ticker") or {}
+        if kr:
+            try:
+                # a = ask [price, whole lot, lot], b = bid, c = last trade
+                last = float((kr.get("c") or [0])[0] or 0)
+                bid = float((kr.get("b") or [0])[0] or 0)
+                ask = float((kr.get("a") or [0])[0] or 0)
+                if snap.price > 0 and last > 0:
+                    snap.price_divergence_bps = abs(last - snap.price) / snap.price * 10000
+                elif last > 0 and snap.price <= 0:
+                    snap.price = last
+                    snap.bid = bid or last
+                    snap.ask = ask or last
+                    snap.price_ts = time.time()
+                    snap.price_age = 0.0
+            except (TypeError, ValueError, IndexError):
+                pass
 
-        trades = results.get("trades") or []
-        if trades:
-            buy = sum(float(t["qty"]) for t in trades if not t.get("isBuyerMaker"))
-            sell = sum(float(t["qty"]) for t in trades if t.get("isBuyerMaker"))
-            tot = buy + sell
-            snap.trade_imbalance = (buy - sell) / tot if tot > 0 else 0.0
+        # Binance soft fallback price
+        bn = results.get("bn_ticker") or {}
+        if bn and snap.price <= 0:
+            try:
+                bid = float(bn.get("bidPrice") or 0)
+                ask = float(bn.get("askPrice") or 0)
+                if bid and ask:
+                    snap.price = (bid + ask) / 2
+                    snap.bid = bid
+                    snap.ask = ask
+                    snap.price_ts = time.time()
+                    snap.price_age = 0.0
+            except (TypeError, ValueError):
+                pass
 
-        for key, iv in [("k1m", "1m"), ("k5m", "5m"), ("k15m", "15m"), ("k30m", "30m"), ("k1h", "1h")]:
-            kl = results.get(key)
+        # ---- Klines: prefer Coinbase, fill gaps with Kraken ----
+        mapping = [
+            ("1m", "cb_1m", "kr_1m"),
+            ("5m", "cb_5m", None),
+            ("15m", "cb_15m", "kr_15m"),
+            ("1h", "cb_1h", None),
+        ]
+        for iv, primary, secondary in mapping:
+            kl = results.get(primary) or (results.get(secondary) if secondary else None)
             if kl:
                 snap.klines[iv] = kl
                 if snap.price <= 0 and kl:
                     snap.price = kl[-1].close
-                    snap.price_ts = kl[-1].open_time + 60
+                    snap.price_ts = kl[-1].open_time + (60 if iv == "1m" else 300)
                     snap.price_age = max(0.0, time.time() - snap.price_ts)
 
-        cb = results.get("cb")
-        if cb and snap.price > 0:
-            snap.price_divergence_bps = abs(cb - snap.price) / snap.price * 10000
+        # Approximate trade imbalance from recent 1m volume direction if no trades feed
+        # (Coinbase doesn't give easy public trade aggression without auth)
+        c1 = snap.klines.get("1m") or []
+        if len(c1) >= 3 and snap.trade_imbalance == 0.0:
+            ups = sum(1 for c in c1[-5:] if c.close >= c.open)
+            downs = len(c1[-5:]) - ups
+            tot = ups + downs
+            if tot:
+                snap.trade_imbalance = (ups - downs) / tot * 0.3  # muted proxy
 
         snap.errors = errors
         if snap.price_ts:
